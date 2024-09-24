@@ -1,0 +1,57 @@
+include:
+  - project: banthas/gitlabci-includes
+    ref: 5.1.3
+    file: /base-jobs.yml
+  - project: includes/release
+    file: /auto.yaml
+    ref: 3.5.5
+
+variables:
+  DOCKER_BUILDKIT: 1
+  IMAGE_PATH: releases.docker.nexus.ocado.tech/banthas/bloblo
+  PROJECT_PATH: "banthas/oss-forks/bloblo"
+  GITLAB_TOKEN: ${ALDI_PROJECT_ACCESS_TOKEN}
+  GITLAB_API_TOKEN: ${ALDI_PROJECT_ACCESS_TOKEN}
+  ROTATOR_CONFIG_PATH: cicd-tokens-rotator.yml
+
+.docker:
+  image: internal.docker.nexus.ocado.tech/internal-open-source/docker-build:3.16.1@sha256:2c83ed80c2267522bf478f7187e3d6cfc1e19e1ab19639fedd1abc57613bfaed
+  tags:
+    - shared-aws-m-large-docker
+  before_script:
+    - . ${ALDI_SETUP}
+  script:
+    - FULL_IMAGE_PATH="${IMAGE_PATH}:${CI_COMMIT_TAG:-$CI_COMMIT_SHA}"
+    - docker build -t "${FULL_IMAGE_PATH}" --progress=plain --secret id="netrc,src=${HOME}/.netrc" .
+    - if [ "${NO_PUSH}" = "" ]; then docker push "${FULL_IMAGE_PATH}"; fi
+
+build:
+  extends: .docker
+  variables:
+    NO_PUSH: "--no-push"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+  stage: build
+
+deploy:
+  extends: .docker
+  variables:
+    NO_PUSH: ""
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG'
+  stage: deploy
+
+rotate tokens:
+  image: releases.docker.nexus.ocado.tech/banthas/cicd-tokens-rotator:1.4.0@sha256:b1f4789d65099725a7d1252e0b844173e96fa72df889e9fdd2c4ee2bf0e599a1
+  stage: deploy
+  tags:
+    - shared-aws-t-micro
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "cicd-tokens-rotation"'
+  script:
+    - cd /rotator
+    - poetry run rotator "${CI_PROJECT_DIR}/${ROTATOR_CONFIG_PATH}"

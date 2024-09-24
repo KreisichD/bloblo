@@ -7,6 +7,17 @@ the rest of the traffic.
 
 A simple HEAD request is made to verify if the user has the necessary permissions to access the layer.
 
+## Env variables
+
+| Variable                  | Default                  | Desc                                                           |
+| ------------------------- | ------------------------ | -------------------------------------------------------------- |
+| BLOBLO_LISTEN_ADDR        | :7777                    |                                                                |
+| BLOBLO_S3_BUCKET_NAME     | sample-bucket            | Bucket to store cached blobs                                   |
+| BLOBLO_UPSTREAM_URL       | http://localhost:6666    | Url with port to your docker repository                        |
+| BLOBLO_PRESERVE_HOST      | false                    |                                                                |
+| BLOBLO_USE_LOCALSTACK     | false                    |                                                                |
+
+
 ## Test scenario
 
 Currently the test shows a redirect to a presigned url for a single layer (`sha256:dfcff6d93b39097b3e4f343e505e1af69ccc98d4122439edc882f1ab908f48cb`),

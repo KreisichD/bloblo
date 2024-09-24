@@ -7,6 +7,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/patrickmn/go-cache"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -34,7 +36,9 @@ var (
 	upstreamUrl  *url.URL
 	preserveHost bool
 
-	cachedBlobDigests map[string]bool
+	connectEndpointCache *cache.Cache
+	tokenEndpointCache   *cache.Cache
+	cachedBlobDigests    map[string]bool
 )
 
 func initLogger() {
@@ -112,6 +116,14 @@ func init() {
 		return
 	}
 
+	cacheExpirationTime, err := strconv.Atoi(os.Getenv("BLOBLO_CACHE_EXPIRATION_MINUTES"))
+	if err != nil {
+		cacheExpirationTime = 10
+	}
+
+	connectEndpointCache = cache.New(time.Duration(cacheExpirationTime)*time.Minute, 10*time.Minute)
+	tokenEndpointCache = cache.New(time.Duration(cacheExpirationTime)*time.Minute, 10*time.Minute)
+
 	s3Client = s3.NewFromConfig(awsConfig, func(opts *s3.Options) {
 		opts.UsePathStyle = true
 	})
@@ -154,36 +166,89 @@ func getUpstreamRequest(req *http.Request) *http.Request {
 	return upstreamReq
 }
 
+func performUpstreamRequest(req *http.Request) *http.Response {
+	upstreamReq := getUpstreamRequest(req)
+	response, err := http.DefaultClient.Do(upstreamReq)
+	if err != nil {
+		logger.Error("Failed to reach the upstream", zap.String("error", err.Error()))
+	}
+	logger.Info("Response", zap.String("response", response.Status), zap.String("request", req.RequestURI))
+	return response
+}
+
+func cachedEndpointHandler(w http.ResponseWriter, req *http.Request, cacheStore *cache.Cache) bool {
+	auth_header := req.Header.Get("Authorization")
+	cache_value, ok := cacheStore.Get(auth_header)
+	if ok {
+		logger.Info("Serving cached response", zap.String("request", req.RequestURI), zap.String("cache_key", auth_header), zap.String("cache_value", string(cache_value.([]byte))))
+		w.Write(cache_value.([]byte))
+		return true
+	}
+
+	response := performUpstreamRequest(req)
+
+	defer response.Body.Close()
+	body_data, err := io.ReadAll(response.Body)
+	if err != nil {
+		logger.Error("Failed to read response body", zap.String("error", err.Error()))
+		w.WriteHeader(http.StatusInternalServerError)
+		return false
+	}
+
+	cacheStore.Set(auth_header, body_data, cache.DefaultExpiration)
+	return false
+}
+
 func (rl *blobloProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	logger.Info("Incoming request", zap.String("request", req.RequestURI), zap.String("method", req.Method))
+	response_from_cache := false
 
 	pathElements := strings.Split(req.RequestURI, "/")
+
+	response_from_cache = rl.ServeCachedDockerApiEndpoint(w, req, pathElements) || rl.ServeDockerBlob(w, req, pathElements)
+
+	if !response_from_cache {
+		rl.proxy.ServeHTTP(w, req)
+	}
+}
+
+func (rl *blobloProxy) ServeCachedDockerApiEndpoint(w http.ResponseWriter, req *http.Request, pathElements []string) bool {
+	if req.Method == http.MethodGet {
+		if len(pathElements) == 3 && pathElements[1] == "v2" && pathElements[2] == "" {
+			logger.Info("Request is for a Docker connectivity check", zap.String("request", req.RequestURI))
+			return cachedEndpointHandler(w, req, connectEndpointCache)
+
+		}
+
+		if len(pathElements) == 3 && pathElements[2] == "token" {
+			logger.Info("Request is for a Docker token request", zap.String("request", req.RequestURI))
+			return cachedEndpointHandler(w, req, tokenEndpointCache)
+		}
+	}
+	return false
+}
+
+func (rl *blobloProxy) ServeDockerBlob(w http.ResponseWriter, req *http.Request, pathElements []string) bool {
 	if req.Method == http.MethodGet && len(pathElements) > 2 && pathElements[len(pathElements)-2] == "blobs" {
 		blobDigest := pathElements[len(pathElements)-1]
 
 		headReq := getUpstreamRequest(req)
 		headReq.Method = http.MethodHead
-		response, err := http.DefaultClient.Do(headReq)
+		head_response, err := http.DefaultClient.Do(headReq)
 		if err != nil {
 			logger.Error("Failed to reach the upstream", zap.String("error", err.Error()))
 			w.WriteHeader(http.StatusInternalServerError)
-			return
+			return false
 		}
-		if response.StatusCode == http.StatusOK {
+		if head_response.StatusCode == http.StatusOK {
 			if blobInCache(blobDigest) {
 				user, _, _ := headReq.BasicAuth()
 				logger.Info("Serving blob from cache", zap.String("digest", blobDigest), zap.String("user", user), zap.String("action", "serve_blob"))
 				http.Redirect(w, req, presignBlob(blobDigest), http.StatusFound)
-				return
+				return true
 			} else { // upload the blob to cache and return the layer to the client
-				upstreamReq := getUpstreamRequest(req)
-				response, err := http.DefaultClient.Do(upstreamReq)
-				if err != nil {
-					logger.Error("Failed to reach the upstream", zap.String("error", err.Error()))
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-				teeReader := io.TeeReader(response.Body, w)
+				upstream_req_response := performUpstreamRequest(req)
+				teeReader := io.TeeReader(upstream_req_response.Body, w)
 
 				logger.Info("Uploading blob to cache", zap.String("digest", blobDigest), zap.String("action", "upload_blob"))
 				_, err = s3Uploader.Upload(
@@ -197,13 +262,11 @@ func (rl *blobloProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				if err != nil {
 					logger.Error("Error uploading blob", zap.String("digest", blobDigest), zap.String("error", err.Error()))
 				}
-
-				return
 			}
+
 		}
 	}
-
-	rl.proxy.ServeHTTP(w, req)
+	return false
 }
 
 func main() {
@@ -218,6 +281,8 @@ func main() {
 		logger.Error("The AWS configuration seems to be invalid", zap.String("error", err.Error()))
 		logger.Fatal(err.Error())
 	}
+
+	logger.Info("Running bloblo proxy")
 
 	//a custom Director is needed, as we have to set the host header
 	r := blobloProxy{proxy: &httputil.ReverseProxy{Director: func(req *http.Request) {
