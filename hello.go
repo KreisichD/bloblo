@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -176,60 +178,98 @@ func performUpstreamRequest(req *http.Request) *http.Response {
 	return response
 }
 
-func cachedEndpointHandler(w http.ResponseWriter, req *http.Request, cacheStore *cache.Cache) bool {
-	auth_header := req.Header.Get("Authorization")
-	cache_value, ok := cacheStore.Get(auth_header)
+type TokenData struct {
+	Token string `json:"token"`
+}
+
+func checkJsonTokenData(responseData []byte) bool {
+	var v TokenData
+	if err := json.Unmarshal(responseData, &v); err != nil {
+		logger.Error("Response is not a JSON, processing", zap.String("error", err.Error()))
+		return false
+	}
+	logger.Info("Checking Json token", zap.String("token", v.Token))
+
+	regexp_check, err := regexp.MatchString("^DockerToken.[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$", v.Token)
+	if err != nil {
+		logger.Error("Error matching token pattern", zap.String("error", err.Error()))
+		return false
+	}
+	return regexp_check
+}
+
+// func copyHeaders(from http.Header, to http.Header) {
+// 	for key, values := range from {
+// 		for _, value := range values {
+// 			to.Add(key, value)
+// 		}
+// 	}
+// }
+
+func cachedEndpointHandler(w http.ResponseWriter, req *http.Request, cacheStore *cache.Cache, checkToken bool) bool {
+	authHeader := req.Header.Get("Authorization")
+	cacheValue, ok := cacheStore.Get(authHeader)
 	if ok {
-		logger.Info("Serving cached response", zap.String("request", req.RequestURI), zap.String("cache_key", auth_header), zap.String("cache_value", string(cache_value.([]byte))))
-		w.Write(cache_value.([]byte))
+		logger.Info("Serving cached response", zap.String("request", req.RequestURI))
+		if checkToken && !checkJsonTokenData(cacheValue.([]byte)) {
+			logger.Error("Cached response is not a valid token", zap.String("response", string(cacheValue.([]byte))))
+			return false
+		}
+		w.Write(cacheValue.([]byte))
 		return true
 	}
 
 	response := performUpstreamRequest(req)
 
 	defer response.Body.Close()
-	body_data, err := io.ReadAll(response.Body)
+	bodyData, err := io.ReadAll(response.Body)
 	if err != nil {
 		logger.Error("Failed to read response body", zap.String("error", err.Error()))
 		w.WriteHeader(http.StatusInternalServerError)
-		return false
+		return true
 	}
 
-	cacheStore.Set(auth_header, body_data, cache.DefaultExpiration)
+	if response.StatusCode == http.StatusOK {
+		if checkToken && !checkJsonTokenData(bodyData) {
+			logger.Error("Response is not valid token, do not save in cache, try proxtying to nexus instead", zap.String("response", string(cacheValue.([]byte))))
+			return false
+		}
+		cacheStore.Set(authHeader, bodyData, cache.DefaultExpiration)
+	}
 	return false
 }
 
 func (rl *blobloProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	logger.Info("Incoming request", zap.String("request", req.RequestURI), zap.String("method", req.Method))
-	response_from_cache := false
+	nexus_request_performed := false
 
-	pathElements := strings.Split(req.RequestURI, "/")
+	if req.Method == http.MethodGet {
+		pathElements := strings.Split(req.RequestURI, "/")
+		nexus_request_performed = rl.ServeCachedDockerApiEndpoint(w, req, pathElements) || rl.ServeDockerBlob(w, req, pathElements)
+	}
 
-	response_from_cache = rl.ServeCachedDockerApiEndpoint(w, req, pathElements) || rl.ServeDockerBlob(w, req, pathElements)
-
-	if !response_from_cache {
+	if !nexus_request_performed {
 		rl.proxy.ServeHTTP(w, req)
 	}
 }
 
 func (rl *blobloProxy) ServeCachedDockerApiEndpoint(w http.ResponseWriter, req *http.Request, pathElements []string) bool {
-	if req.Method == http.MethodGet {
-		if len(pathElements) == 3 && pathElements[1] == "v2" && pathElements[2] == "" {
-			logger.Info("Request is for a Docker connectivity check", zap.String("request", req.RequestURI))
-			return cachedEndpointHandler(w, req, connectEndpointCache)
-
-		}
-
-		if len(pathElements) == 3 && pathElements[2] == "token" {
-			logger.Info("Request is for a Docker token request", zap.String("request", req.RequestURI))
-			return cachedEndpointHandler(w, req, tokenEndpointCache)
-		}
+	if len(pathElements) == 3 && pathElements[1] == "v2" && pathElements[2] == "" {
+		logger.Info("Request is for a Docker connectivity check", zap.String("request", req.RequestURI))
+		return cachedEndpointHandler(w, req, connectEndpointCache, false)
 	}
+
+	lastPathElementWithoutParams := strings.Split(pathElements[len(pathElements)-1], "?")[0]
+	if len(pathElements) == 3 && lastPathElementWithoutParams == "token" {
+		logger.Info("Request is for a Docker token request", zap.String("request", req.RequestURI))
+		return cachedEndpointHandler(w, req, tokenEndpointCache, true)
+	}
+
 	return false
 }
 
 func (rl *blobloProxy) ServeDockerBlob(w http.ResponseWriter, req *http.Request, pathElements []string) bool {
-	if req.Method == http.MethodGet && len(pathElements) > 2 && pathElements[len(pathElements)-2] == "blobs" {
+	if len(pathElements) > 2 && pathElements[len(pathElements)-2] == "blobs" {
 		blobDigest := pathElements[len(pathElements)-1]
 
 		headReq := getUpstreamRequest(req)
@@ -240,6 +280,9 @@ func (rl *blobloProxy) ServeDockerBlob(w http.ResponseWriter, req *http.Request,
 			w.WriteHeader(http.StatusInternalServerError)
 			return false
 		}
+
+		defer head_response.Body.Close()
+
 		if head_response.StatusCode == http.StatusOK {
 			if blobInCache(blobDigest) {
 				user, _, _ := headReq.BasicAuth()
@@ -248,6 +291,7 @@ func (rl *blobloProxy) ServeDockerBlob(w http.ResponseWriter, req *http.Request,
 				return true
 			} else { // upload the blob to cache and return the layer to the client
 				upstream_req_response := performUpstreamRequest(req)
+				defer upstream_req_response.Body.Close()
 				teeReader := io.TeeReader(upstream_req_response.Body, w)
 
 				logger.Info("Uploading blob to cache", zap.String("digest", blobDigest), zap.String("action", "upload_blob"))
@@ -262,8 +306,8 @@ func (rl *blobloProxy) ServeDockerBlob(w http.ResponseWriter, req *http.Request,
 				if err != nil {
 					logger.Error("Error uploading blob", zap.String("digest", blobDigest), zap.String("error", err.Error()))
 				}
+				return true
 			}
-
 		}
 	}
 	return false

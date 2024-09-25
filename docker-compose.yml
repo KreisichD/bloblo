@@ -1,7 +1,7 @@
 services:
   nexus:
     container_name: bloblo_nexus
-    image: hub.docker.nexus.ocado.tech/sonatype/nexus3:3.72.0@sha256:c2c60fb29799b10e398615f6dcbf53f7e0a86650ee28f180585dacc3a7889a0d
+    image: sonatype/nexus3:3.72.0@sha256:c2c60fb29799b10e398615f6dcbf53f7e0a86650ee28f180585dacc3a7889a0d
     ports:
       - "8081:8081"
       - "8082:8082"
@@ -18,7 +18,7 @@ services:
       timeout: 5s
   localstack:
     container_name: bloblo_localstack
-    image: hub.docker.nexus.ocado.tech/localstack/localstack:3.7.2@sha256:0595938dce1b36c488a52e6f04fbe805fb01f3b7e68ac2add02432d255954c79
+    image: localstack/localstack:3.7.2@sha256:0595938dce1b36c488a52e6f04fbe805fb01f3b7e68ac2add02432d255954c79
     ports:
       - "4566:4566"
     environment:
